@@ -12,6 +12,20 @@ import reconnect as app
 class ReconnectTests(unittest.TestCase):
     """测试无人值守时必须保持的认证边界和停止条件。"""
 
+    def test_manual_login_does_not_require_campus_gateway(self):
+        """家中手动测试直接认证，不请求校内网关；无参数。"""
+        config = {"timeout_seconds": 1, "portal_url": "http://net.njtech.edu.cn/", "max_daily_submissions": 12, "cooldown_minutes": 30}
+        with patch.object(app, 'current_state', return_value={}), patch.object(app, 'fetch', side_effect=AssertionError('手动测试不应请求校内入口')), patch.object(app, 'write_json'), patch.object(app, 'authenticate', return_value=True) as authenticate:
+            self.assertEqual(app.run_check(config, True, True), 0)
+            authenticate.assert_called_once()
+
+    def test_automatic_reconnect_waits_when_campus_unreachable(self):
+        """自动重连遇到基础网络故障时不提交认证；无参数。"""
+        config = {"timeout_seconds": 1, "portal_url": "http://net.njtech.edu.cn/", "max_daily_submissions": 12, "cooldown_minutes": 30}
+        with patch.object(app, 'current_state', return_value={}), patch.object(app, 'internet_available', return_value=False), patch.object(app.time, 'sleep'), patch.object(app, 'fetch', side_effect=OSError()), patch.object(app, 'authenticate') as authenticate:
+            self.assertEqual(app.run_check(config, False, False), 2)
+            authenticate.assert_not_called()
+
     def test_captive_redirect_is_not_online(self):
         """门户页面即使返回 HTTP 200，也不应被认为已联网；无参数。"""
         with patch.object(app, "fetch", return_value=(200, "https://sfgl.njtech.edu.cn/", b"login")):
@@ -77,6 +91,38 @@ class ReconnectTests(unittest.TestCase):
         with patch.object(app.sys, 'argv', ['reconnect.py', 'disable']), patch.object(app, 'configure_logging'), patch.object(app, 'single_instance', side_effect=AssertionError('管理命令不应获取认证锁')), patch.object(app, 'manage_task', return_value=0) as manage:
             self.assertEqual(app.main(), 0)
             manage.assert_called_once_with('disable', False)
+
+    def test_captcha_input_excludes_hidden_field(self):
+        """验证码输入框必须排除同名隐藏域，避免严格模式匹配多个元素；无参数。"""
+        recorded = []
+
+        class FakeLocator:
+            def wait_for(self, **kwargs):
+                pass
+
+        class FakePage:
+            url = "https://sfgl.njtech.edu.cn/cas/login"
+
+            def goto(self, *args, **kwargs):
+                pass
+
+            def get_by_placeholder(self, *args, **kwargs):
+                return FakeLocator()
+
+            def locator(self, selector):
+                recorded.append(selector)
+                return FakeLocator()
+
+        app.open_form(FakePage(), {"entry_url": "https://i.njtech.edu.cn/"})
+        self.assertIn('input[name="captcha_code"]:not([type="hidden"])', recorded)
+        self.assertIn(app.CAPTCHA_SELECTOR, recorded)
+
+    def test_user_data_dir_survives_missing_localappdata(self):
+        """计划任务环境可能没有 LOCALAPPDATA，数据目录必须有回退；无参数。"""
+        with patch.dict(app.os.environ, {"LOCALAPPDATA": ""}):
+            fallback = Path(app.user_data_dir())
+        self.assertEqual(fallback.name, "NjtechNetReconnect")
+        self.assertEqual(fallback.parent.name, "Local")
 
 
 if __name__ == "__main__":

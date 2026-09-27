@@ -1,5 +1,5 @@
 # 功能：检查南京工业大学办公室网络，通过 Edge 和本地 OCR 完成统一身份认证。
-# 流程：setup 完成首次配置；enable/status/disable/remove 管理任务；check 仅在断网时重连。
+# 流程：setup 完成首次配置；enable/status/disable/remove 管理任务；check 仅在断网时重连；test-login 可在校外直接验证登录。
 # 输入：config.json、当前 Windows 用户的凭据库和校内页面；输出：用户数据目录中的状态和脱敏日志。
 import argparse
 import contextlib
@@ -18,9 +18,15 @@ import time
 import urllib.request
 from urllib.parse import urlparse
 
+def user_data_dir():
+    """返回发布版的用户数据目录；无参数，LOCALAPPDATA 缺失时回退到用户目录，避免计划任务环境下模块导入即失败。"""
+    base = os.environ.get("LOCALAPPDATA")
+    return (Path(base) if base else Path.home() / "AppData" / "Local") / "NjtechNetReconnect"
+
+
 ASSETS = Path(__file__).resolve().parent
 ROOT = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else ASSETS
-DATA = Path(os.environ["LOCALAPPDATA"]) / "NjtechNetReconnect" if getattr(sys, "frozen", False) else ROOT
+DATA = user_data_dir() if getattr(sys, "frozen", False) else ROOT
 RUNTIME = DATA / "runtime"
 CONFIG = DATA / "config.json"
 STATE = RUNTIME / "state.json"
@@ -75,8 +81,13 @@ def single_instance():
 
 
 def vault():
-    """明确使用 Windows 凭据管理器；无参数，不允许回退到明文密码存储。"""
+    """明确使用 Windows 凭据管理器；无参数，依赖缺失时给出明确错误而不回退到明文密码存储。"""
     from keyring.backends.Windows import WinVaultKeyring
+    # 后端在导入失败时会延迟到调用时才报错；这里提前校验，避免出现难以理解的 NameError。
+    try:
+        WinVaultKeyring.priority
+    except RuntimeError as error:
+        raise RuntimeError("Windows 凭据库组件不可用，请使用完整发布包重新解压后再运行。") from error
     return WinVaultKeyring()
 
 
@@ -98,6 +109,15 @@ def internet_available(timeout):
         except (OSError, ValueError):
             continue
     return False
+
+
+def campus_gateway_reachable(config):
+    """检查校内网络入口是否可达；config：入口和超时配置。用于判断基础网络是否正常，校外地址不受此项限制。"""
+    try:
+        fetch(config["portal_url"], config["timeout_seconds"])
+        return True
+    except OSError:
+        return False
 
 
 def load_config():
@@ -166,7 +186,9 @@ def open_form(page, config):
     username.wait_for(state="visible", timeout=45_000)
     if not trusted_auth_url(page.url):
         raise RuntimeError("当前表单不在可信认证域名，已停止。")
-    return username, page.get_by_placeholder("请输入密码", exact=True), page.locator('input[name="captcha_code"]'), page.locator(CAPTCHA_SELECTOR)
+    # 页面同时存在同名的隐藏 captcha_code 域，必须排除，否则 Playwright 严格模式会因匹配多个元素而报错。
+    code = page.locator('input[name="captcha_code"]:not([type="hidden"])')
+    return username, page.get_by_placeholder("请输入密码", exact=True), code, page.locator(CAPTCHA_SELECTOR)
 
 
 def captcha_bytes(image):
@@ -268,8 +290,9 @@ def authenticate(config, state, headed):
 
 
 def run_check(config, force, headed):
-    """检查并重连；config：配置；force：人工测试时即使在线也认证；headed：是否显示窗口。"""
+    """检查并重连；config：配置；force：人工测试（跳过在线与校内入口检查，直接认证）；headed：是否显示窗口。"""
     state = current_state()
+    # 自动重连先确认确实断网；人工测试忽略在线状态，也允许在校外直接认证。
     if not force:
         # 连续检测两次，正常联网时不启动浏览器。
         for index in range(2):
@@ -281,16 +304,15 @@ def run_check(config, force, headed):
     if not allowed_to_submit(state, config):
         logging.warning("处于冷却、每日次数上限或暂停状态，本轮不提交登录。")
         return 2
-    # 校内入口也不可达时，只等待基础网络恢复，不尝试认证。
-    try:
-        fetch(config["portal_url"], config["timeout_seconds"])
-    except OSError:
-        logging.warning("校内网络入口不可达，等待下一轮检查。")
-        return 2
-    state["next_attempt"] = time.time() + config["cooldown_minutes"] * 60
-    write_json(STATE, state)
-    if force:
-        logging.info("人工登录测试：在线时的测试不能证明断网恢复能力。")
+    # 自动重连要求校内入口可达，避免基础网络故障时反复提交登记；人工测试直接访问统一认证。
+    if not force:
+        if not campus_gateway_reachable(config):
+            logging.warning("校内网络入口不可达，等待下一轮检查；如需在校外测试登录，请运行 test-login。")
+            return 2
+        state["next_attempt"] = time.time() + config["cooldown_minutes"] * 60
+        write_json(STATE, state)
+        return 0 if authenticate(config, state, headed) else 2
+    logging.info("人工登录测试：跳过在线与校内网络入口检查；校外或在线测试不能证明校园网断网恢复能力。")
     return 0 if authenticate(config, state, headed) else 2
 
 
@@ -309,7 +331,7 @@ def background_command():
 
 def manage_task(operation, preview=False):
     """管理当前用户的任务；operation：enable/status/disable/remove；preview：只输出任务 XML，不注册。"""
-    powershell = Path(os.environ["SystemRoot"]) / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe"
+    powershell = Path(os.environ.get("SystemRoot") or r"C:\Windows") / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe"
     command = [str(powershell), "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(ASSETS / "manage-task.ps1"), "-Operation", operation]
     if operation == "enable":
         if not preview:
@@ -344,7 +366,9 @@ def self_test():
         result = new_ocr().classification(buffer.getvalue())
         if not isinstance(result, str) or not result:
             raise RuntimeError("OCR 自检未返回字符。")
-    vault()
+    # 读取一个不存在的凭据，验证 Windows 凭据库后端可实际调用，且不写入任何数据。
+    if vault().get_password("NjtechNetReconnectSelfTest", "probe") is not None:
+        raise RuntimeError("凭据库自检返回了非预期数据。")
     with sync_playwright() as playwright:
         browser = browser_context(playwright, False)
         try:
@@ -425,4 +449,10 @@ def main():
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except SystemExit:
+        raise
+    except BaseException:
+        # 窗口模式下未捕获异常会弹出不可见对话框并永久挂起计划任务，这里改为静默退出。
+        raise SystemExit(1)

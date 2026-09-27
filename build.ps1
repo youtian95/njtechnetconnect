@@ -19,7 +19,11 @@ try {
     & (Join-Path $bundle 'njtechnetconnect.exe') self-test --data-dir (Join-Path $PSScriptRoot 'output\build-smoke')
     if ($LASTEXITCODE -ne 0) { throw 'EXE 自检失败，停止制作发布 ZIP。' }
     $zipPath = Join-Path $PSScriptRoot 'dist\njtechnetconnect-windows-x64.zip'
-    Compress-Archive -LiteralPath $bundle -DestinationPath $zipPath -Force
+    # 自检刚结束，EXE 可能被 Windows 短暂占用；重试几次压缩，避免偶发失败。
+    for ($attempt = 1; ; $attempt++) {
+        try { Compress-Archive -LiteralPath $bundle -DestinationPath $zipPath -Force; break }
+        catch { if ($attempt -ge 3) { throw }; Start-Sleep -Seconds 3 }
+    }
     $hash = (Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash.ToLower()
     Set-Content -LiteralPath ($zipPath + '.sha256') -Value ($hash + '  ' + [System.IO.Path]::GetFileName($zipPath)) -Encoding ascii
     Write-Output ('发布包：' + $zipPath)
