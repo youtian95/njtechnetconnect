@@ -1,0 +1,9 @@
+{
+  "username": "",
+  "entry_url": "https://i.njtech.edu.cn/",
+  "portal_url": "http://net.njtech.edu.cn/",
+  "timeout_seconds": 10,
+  "max_attempts": 3,
+  "cooldown_minutes": 30,
+  "max_daily_submissions": 12
+}

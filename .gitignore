@@ -1,0 +1,8 @@
+.venv/
+.playwright-cli/
+__pycache__/
+config.json
+runtime/
+output/
+build/
+dist/
